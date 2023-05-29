@@ -98,27 +98,322 @@
 #define AES_ECB (0x00)
 #define AES_CBC (0x01)
 
+/// re-implementation
+typedef enum {
+  SE_SECURE_SEND = 1 << 0,
+  SE_SECURE_READ = 1 << 1,
+} SE_APDU_SECURE_FLAG;
+
+// `cond` is `true` or `false`
+// if `cond` is `false` then this macro check failed and return `false`
+#define SE_CHECK_COND(cond)    \
+  do {                         \
+    if (!(cond)) return false; \
+  } while (0)
+
+#define SW_SUCCESS 0x9000
+#define MIN(a, b) (a) > (b) ? b : a
+
+#define DEBUG_APDU 0
+
+#if DEBUG_APDU
+// [apdu buffer 1.5k] | [resp buffer 1.5k]
+#define SE_SHARED_BUFFER_MAX_SIZE 0xC00  // 3k
+#else
+// apdu/resp share same buffer
+#define SE_SHARED_BUFFER_MAX_SIZE 0x600  // 1.5k
+#endif
+
+static uint8_t _se_shared_buffer_[SE_SHARED_BUFFER_MAX_SIZE];
+#if DEBUG_APDU
+#define SE_APDU_BUFFER ((uint8_t *)_se_shared_buffer_)
+#define SE_RESP_BUFFER (((uint8_t *)_se_shared_buffer_) + 0x600)
+#else
+#define SE_APDU_BUFFER ((uint8_t *)_se_shared_buffer_)
+#define SE_RESP_BUFFER ((uint8_t *)_se_shared_buffer_)
+#endif
+
+typedef struct {
+  uint8_t cla;
+  uint8_t ins;
+  uint8_t p1;
+  uint8_t p2;
+  uint16_t lc;
+  const uint8_t *data;
+  uint16_t le;
+} apdu_t;
+
+#define APDU_INIT(cla, ins, p1, p2) apdu_t apdu = {cla, ins, p1, p2, 0, NULL, 0}
+
+#define APDU_SET_DATA(apdu, d, l) \
+  (apdu)->lc = l;                 \
+  (apdu)->data = d
+
+// use must known `RESP` size
+#define SE_RESP_N(n) \
+  struct {           \
+    uint8_t data[n]; \
+    uint8_t sw1;     \
+    uint8_t sw2;     \
+  }
+
+// define a `resp` variable pointer to `SE_RESP_N` struct
+#define RESP_INIT_N(n) SE_RESP_N(n) *resp = (void *)(SE_RESP_BUFFER)
+
+// get SW from `RESP` struct
+#define RESP_SW(resp) ((resp)->sw1 << 8 | (resp)->sw2)
+
+#define SW_REQUIRE(sw, v)       \
+  do {                          \
+    SE_CHECK_COND((sw) == (v)); \
+  } while (0)
+
+#define SE_PUT_UINT16_BE(p, v) \
+  do {                         \
+    *p++ = ((v) >> 8) & 0xFF;  \
+    *p++ = (v)&0xFF;           \
+  } while (0)
+
+#define SE_GET_UINT16_BE(p, i, v)         \
+  do {                                    \
+    v = (*(p + i)) << 8 | (*(p + i + 1)); \
+  } while (0)
+
 uint8_t g_ucSessionKey[SESSION_KEYLEN];
 
 uint32_t se_transmit_plain(uint8_t *pucSendData, uint16_t usSendLen,
                            uint8_t *pucRevData, uint16_t *pusRevLen);
 
-bool randomBuf_SE(uint8_t *ucRandom, uint8_t ucLen) {
-  uint8_t ucRandomCmd[5] = {0x00, 0x84, 0x00, 0x00, 0x00}, ucTempBuf[32];
-  uint16_t usLen;
+/// `apdu` layer
+static inline void se_build_apdu(const apdu_t *apdu,
+                                 uint16_t *apdu_buffer_len) {
+  uint8_t *p = SE_APDU_BUFFER;
+  // header
+  memcpy(p, apdu, 4);
+  p += 4;
+  // lc data
+  if (apdu->lc && apdu->data) {
+    if (apdu->lc > 0xFF) {
+      *p++ = 0;
+      SE_PUT_UINT16_BE(p, apdu->lc);
+    } else if (apdu->lc) {
+      *p++ = apdu->lc;
+    }
+    memcpy(p, apdu->data, apdu->lc);
+    p += apdu->lc;
+  }
+  // le
+  if (apdu->le > 0xFF) {
+    *p++ = 0;
+    SE_PUT_UINT16_BE(p, apdu->le);
+  } else if (apdu->le) {
+    *p++ = apdu->le;
+  }
 
-  ucRandomCmd[4] = ucLen;
-  usLen = sizeof(ucTempBuf);
-  if (!bMI2CDRV_SendData(ucRandomCmd, sizeof(ucRandomCmd))) {
-    return false;
+  // se required
+  if (!apdu->lc && !apdu->le) {
+    *p++ = 0x00;
   }
-  delay_ms(5);
-  if (!bMI2CDRV_ReceiveData(ucTempBuf, &usLen)) {
-    return false;
+
+  *apdu_buffer_len = p - SE_APDU_BUFFER;
+}
+
+// define `apdu_bytes` `apdu_bytes_len` and build `apdu`
+#define SE_BUILD_APDU(apdu)                       \
+  uint8_t *apdu_bytes = SE_APDU_BUFFER;           \
+  uint16_t apdu_bytes_len;                        \
+  memzero(apdu_bytes, SE_SHARED_BUFFER_MAX_SIZE); \
+  se_build_apdu(apdu, &apdu_bytes_len)
+
+// send `apdu` and receive `respone`
+bool se_send_apdu_plain(const apdu_t *apdu, uint16_t *resp_len) {
+  SE_BUILD_APDU(apdu);
+  SE_CHECK_COND(mi2c_send(apdu_bytes, apdu_bytes_len));
+  return mi2c_receive(SE_RESP_BUFFER, resp_len);
+}
+
+// send `apdu` and receive `response`
+#define SE_SEND_APDU_PLAIN(apdu)                        \
+  uint8_t *resp_buffer = SE_RESP_BUFFER;                \
+  uint16_t resp_buffer_len = SE_SHARED_BUFFER_MAX_SIZE; \
+  memzero(resp_buffer, resp_buffer_len);                \
+  SE_CHECK_COND(se_send_apdu_plain(apdu, &resp_buffer_len))
+
+inline uint16_t encrypted_data_size(uint16_t lc) {
+  // random|data|padding
+  lc += 0x10;
+  lc = (lc / 16 + 1) * 16;
+  return lc;
+}
+
+inline void se_padding_80(uint8_t **data, uint16_t data_len) {
+  uint16_t padding_size = 16 - data_len % 16;
+  **data = 0x80;
+  (*data)++;
+  padding_size--;
+  if (padding_size) {
+    memzero(*data, padding_size);
+    *data += padding_size;
   }
-  memcpy(ucRandom, ucTempBuf, ucLen);
+}
+
+static inline bool se_build_safe_apdu(const apdu_t *apdu,
+                                      const uint8_t random[0x10],
+                                      uint16_t *apdu_bytes_len) {
+  uint8_t *p = SE_APDU_BUFFER;
+  // header
+  memcpy(p, apdu, 4);
+  p += 4;
+
+  // encrypted data: random|data|padding
+  // encrypted data size
+  uint16_t lc = encrypted_data_size(apdu->lc);
+  if (lc > 0xFF) {
+    *p++ = 0;
+    SE_PUT_UINT16_BE(p, lc);
+  } else {
+    *p++ = lc;
+  }
+
+  // random
+  memcpy(p, random, 0x10);
+  p += 0x10;
+  // data
+  if (apdu->lc && apdu->data) {
+    memcpy(p, apdu->data, apdu->lc);
+    p += apdu->lc;
+  }
+  // padding
+  se_padding_80(&p, apdu->lc + 0x10);
+
+  // move backup pointer
+  p -= lc;
+
+  // encrypt
+  aes_encrypt_ctx ctx;
+  aes_encrypt_key128(g_ucSessionKey, &ctx);
+  aes_ecb_encrypt(p, p, lc, &ctx);
+
+  p += lc;
+  *apdu_bytes_len = p - SE_APDU_BUFFER;
   return true;
 }
+
+inline void se_remove_80(uint8_t *data, uint16_t *data_len) {
+  data += *data_len;
+  while (*--data != 0x80) {
+    *data_len -= 1;
+  }
+  // remove 0x80
+  *data = 0x00;
+}
+
+static inline bool se_decrypt_response(uint8_t random[0x10],
+                                       uint16_t *resp_len) {
+  // encrypted-data | sw
+  SE_CHECK_COND((*resp_len - 2) % 16 == 0);
+  uint16_t le = *resp_len - 2;
+  aes_decrypt_ctx ctx;
+  aes_decrypt_key128(g_ucSessionKey, &ctx);
+  aes_ecb_decrypt(SE_RESP_BUFFER, SE_RESP_BUFFER, le, &ctx);
+  SE_CHECK_COND(memcmp(random, SE_RESP_BUFFER, 0x10) == 0);
+  se_remove_80(SE_RESP_BUFFER, &le);
+
+  // delete random
+  memzero(SE_RESP_BUFFER, 0x10);
+  le -= 0x10;
+  if (le) {
+    memmove(SE_RESP_BUFFER, SE_RESP_BUFFER + 0x10, le);
+  }
+
+  // move response sw
+  SE_RESP_BUFFER[le++] = SE_RESP_BUFFER[*resp_len - 2];
+  SE_RESP_BUFFER[le++] = SE_RESP_BUFFER[*resp_len - 1];
+  *resp_len = le;
+  return true;
+}
+
+static bool se_send_apdu_secure(const apdu_t *apdu, SE_APDU_SECURE_FLAG flag,
+                                uint16_t *resp_len) {
+  // step 0: get random from SE
+  uint8_t random[0x10];
+  SE_CHECK_COND(se_random_buffer(random, sizeof(random)));
+
+  // step 1: build secure apdu bytes
+  uint8_t *apdu_bytes = SE_APDU_BUFFER;
+  uint16_t apdu_bytes_len;
+  memzero(apdu_bytes, SE_SHARED_BUFFER_MAX_SIZE);
+  if (flag & SE_SECURE_SEND) {
+    SE_CHECK_COND(se_build_safe_apdu(apdu, random, &apdu_bytes_len));
+  } else {
+    se_build_apdu(apdu, &apdu_bytes_len);
+  }
+
+  if (apdu->ins == 0xE3) {
+    // add le, for derive key/sign
+    apdu_bytes[apdu_bytes_len++] = 0;
+    if (apdu_bytes_len > 0xFF) {
+      apdu_bytes[apdu_bytes_len++] = 0;
+    }
+  }
+
+  // step 2: send apdu bytes
+  SE_CHECK_COND(mi2c_send(apdu_bytes, apdu_bytes_len));
+  SE_CHECK_COND(mi2c_receive(SE_RESP_BUFFER, resp_len));
+
+  if (flag & SE_SECURE_READ) {
+    // check response sw
+    // if not 0x9000, not need decrypt
+    SE_CHECK_COND(*resp_len >= 2);
+    uint16_t sw;
+    SE_GET_UINT16_BE(SE_RESP_BUFFER, *resp_len - 2, sw);
+    SW_REQUIRE(sw, SW_SUCCESS);
+
+    SE_CHECK_COND(se_decrypt_response(random, resp_len));
+  }
+  return true;
+}
+
+#define SE_SEND_APDU_SECURE(apdu, flag)                 \
+  uint8_t *resp_buffer = SE_RESP_BUFFER;                \
+  uint16_t resp_buffer_len = SE_SHARED_BUFFER_MAX_SIZE; \
+  memzero(resp_buffer, resp_buffer_len);                \
+  SE_CHECK_COND(se_send_apdu_secure(apdu, flag, &resp_buffer_len))
+
+// define `uint16_t sw` and get sw value from response data
+#define SE_GET_RESP_SW()                                    \
+  uint16_t sw;                                              \
+  do {                                                      \
+    SE_CHECK_COND(resp_buffer_len >= 2);                    \
+    SE_GET_UINT16_BE(resp_buffer, resp_buffer_len - 2, sw); \
+  } while (0)
+
+// check `sw` is `SW_SUCCESS`
+#define SE_CHECK_RESP_SW()      \
+  do {                          \
+    SE_GET_RESP_SW();           \
+    SW_REQUIRE(sw, SW_SUCCESS); \
+  } while (0)
+/// `apdu` layer end
+
+/// `command` layer
+bool se_random_buffer(uint8_t *random, uint16_t count) {
+#define SE_RANDOM_PACK 0x10
+  APDU_INIT(0x00, 0x84, 0x00, 0x00);
+  apdu.le = SE_RANDOM_PACK;
+  while (count > 0) {
+    SE_SEND_APDU_PLAIN(&apdu);
+    SE_CHECK_RESP_SW();
+    RESP_INIT_N(SE_RANDOM_PACK);
+    uint16_t pack = MIN(count, SE_RANDOM_PACK);
+    memcpy(random, resp->data, pack);
+    count -= pack;
+    random += pack;
+  }
+  return true;
+}
+
+#define randomBuf_SE se_random_buffer
 
 void random_buffer_ST(uint8_t *buf, size_t len) {
   uint32_t r = 0;
@@ -268,7 +563,6 @@ uint32_t se_transmit(uint8_t ucCmd, uint8_t ucIndex, uint8_t *pucSendData,
     } else {
       memcpy(SH_IOBUFFER + 2, pucSendData, usSendLen);
     }
-
     usSendLen += 7;
     // TODO. add le
     if (MI2C_CMD_ECC_EDDSA == ucCmd) {
@@ -935,80 +1229,32 @@ bool se_applyPinValidtime(void) {
   return true;
 }
 
-// first used it will return false and retry counter
-// last will return true
-// note : first used mode = SE_GENSEDMNISEC_FIRST
-//        other mode =SE_GENSEDMNISEC_OTHER
-// bool se_setSeed(uint8_t *preCnts, uint8_t mode) {
-bool se_setSeed(uint8_t mode) {
-  uint8_t cmd[5] = {0x80, 0xe1, 0x12, 0x00, 0x00};
-  uint8_t cur_cnts = 0xff;
-  uint16_t recv_len = 0;
-
-  // TODO
-  if (SE_GENSEDMNISEC_FIRST != mode && SE_GENSEDMNISEC_OTHER != mode)
-    return false;
-  if (SE_GENSEDMNISEC_FIRST == mode) {
-    if (MI2C_OK != se_transmit_ex(MI2C_CMD_WR_PIN, 0x12, NULL, 0, &cur_cnts,
-                                  &recv_len, MI2C_ENCRYPT, SE_WRFLG_GENSEED,
-                                  mode)) {
-      return false;
-    }
-  } else {
-    if (false == se_transmit_plain(cmd, sizeof(cmd), &cur_cnts, &recv_len)) {
-      return false;
-    }
-  }
-
-  return true;
-}
-
-// bool se_setMinisec(uint8_t *preCnts, uint8_t mode) {
-bool se_setMinisec(uint8_t mode) {
-  uint8_t cmd[5] = {0x80, 0xe1, 0x12, 0x01, 0x00};
-  uint8_t recv_buf[4];
-  uint16_t recv_len = 0;
-  // TODO
-  if (SE_GENSEDMNISEC_FIRST != mode && SE_GENSEDMNISEC_OTHER != mode)
-    return false;
-  if (SE_GENSEDMNISEC_FIRST == mode) {
-    if (MI2C_OK != se_transmit_ex(MI2C_CMD_WR_PIN, 0x12, NULL, 0, recv_buf,
-                                  &recv_len, MI2C_ENCRYPT,
-                                  SE_WRFLG_GENMINISECRET, mode)) {
-      return false;
-    }
-  } else {
-    if (false == se_transmit_plain(cmd, sizeof(cmd), recv_buf, &recv_len)) {
-      return false;
-    }
-  }
-
-  return true;
-}
-
 se_generate_state_t se_beginGenerate(se_generate_type_t type,
                                      se_generate_session_t *session) {
-  uint8_t cur_cnts = 0xff;
-  uint16_t recv_len = 0;
-  if (MI2C_OK == se_transmit_ex(MI2C_CMD_WR_PIN, 0x12, NULL, 0, &cur_cnts,
-                                &recv_len, MI2C_ENCRYPT, type, PROCESS_BEGIN)) {
-    return STATE_FAILD;
-  }
+  APDU_INIT(0x80, 0xE1, 0x12, type);
+  SE_SEND_APDU_SECURE(&apdu, SE_SECURE_SEND);
+  SE_GET_RESP_SW();
+  SW_REQUIRE(sw & SW_SUCCESS, SW_SUCCESS);
+  SE_CHECK_COND((sw & 0xFF) > 0);
+
+  // uint8_t cur_cnts = 0xff;
+  // uint16_t recv_len = 0;
+  // if (MI2C_OK == se_transmit_ex(MI2C_CMD_WR_PIN, 0x12, NULL, 0, &cur_cnts,
+  //                               &recv_len, MI2C_ENCRYPT, type,
+  // PROCESS_BEGIN)) {
+  //   return STATE_FAILD;
+  // }
   session->processing = PROCESS_GENERATING;
   session->type = type;
   return STATE_GENERATING;
 }
 
 se_generate_state_t se_generating(se_generate_session_t *session) {
-  uint8_t cmd[5] = {0x80, 0xe1, 0x12, 0x00, 0x00};
-  uint8_t cur_cnts = 0xff;
-  uint16_t recv_len = 0;
-  cmd[3] = session->type;
-  if (MI2C_OK != se_transmit_plain(cmd, sizeof(cmd), &cur_cnts, &recv_len)) {
-    return STATE_GENERATING;
-  }
-
-  return STATE_COMPLETE;
+  APDU_INIT(0x80, 0xE1, 0x12, session->type);
+  SE_SEND_APDU_PLAIN(&apdu);
+  SE_GET_RESP_SW();
+  SW_REQUIRE(sw & SW_SUCCESS, SW_SUCCESS);
+  return (sw & 0xFF) > 0 ? STATE_GENERATING : STATE_COMPLETE;
 }
 
 bool se_isFactoryMode(void) {
@@ -1084,68 +1330,37 @@ bool se_sessionOpen(IN uint8_t *session_id_bytes) {
   return true;
 }
 
-// TODO. type is seed or minisecret
-bool se_sessionGens(uint8_t *pass_phase, uint16_t len, uint8_t type,
-                    uint8_t mode) {
-  uint8_t cmd[5] = {0x80, 0xe7, 0x02, 0x00, 0x00};
-  uint8_t cur_cnts = 0xff;
-  uint8_t cur_wrflag = 0xff;  // seed and minisecret is different
-  cur_wrflag =
-      (type == SE_WRFLG_GENSEED) ? SE_WRFLG_GENSEED : SE_WRFLG_GENMINISECRET;
-  uint16_t recv_len = 0;
-
-  // TODO
-  if (SE_GENSEDMNISEC_FIRST != mode && SE_GENSEDMNISEC_OTHER != mode)
-    return false;
-  if (SE_GENSEDMNISEC_FIRST == mode) {
-    if (pass_phase == NULL) {  // TODO. it would use default seed and
-                               // minisecret.
-      return MI2C_OK == se_transmit_ex(MI2C_CMD_WR_SESSION, 0x02, NULL, 0,
-                                       &cur_cnts, &recv_len, MI2C_ENCRYPT,
-                                       cur_wrflag, mode);
-    }
-    if (MI2C_OK != se_transmit_ex(MI2C_CMD_WR_SESSION, 0x02, pass_phase, len,
-                                  &cur_cnts, &recv_len, MI2C_ENCRYPT,
-                                  cur_wrflag, mode)) {
-      return false;
-    }
-  } else {
-    if (type == SE_WRFLG_GENMINISECRET) cmd[3] = 0x01;
-    if (false == se_transmit_plain(cmd, sizeof(cmd), &cur_cnts, &recv_len)) {
-      return false;
-    }
-  }
-
-  return true;
-}
-
 se_generate_state_t se_sessionBeginGenerate(const uint8_t *passphase,
                                             uint16_t len,
                                             se_generate_type_t type,
                                             se_generate_session_t *session) {
-  uint8_t cur_cnts = 0xff;
-  uint16_t recv_len = 0;
-  unsigned int ret =
-      se_transmit_ex(MI2C_CMD_WR_SESSION, 0x02, (uint8_t *)passphase, len,
-                     &cur_cnts, &recv_len, MI2C_ENCRYPT, type, PROCESS_BEGIN);
-  if (ret == MI2C_OK) {
-    return STATE_COMPLETE;
-  }
+  APDU_INIT(0x90, 0xE7, 0x02, type);
+  APDU_SET_DATA(&apdu, passphase, len);
+  SE_SEND_APDU_SECURE(&apdu, SE_SECURE_SEND);
+  SE_GET_RESP_SW();
+  SW_REQUIRE(sw & SW_SUCCESS, SW_SUCCESS);
+  SE_CHECK_COND((sw & 0xFF) > 0);
+
+  // uint8_t cur_cnts = 0xff;
+  // uint16_t recv_len = 0;
+  // unsigned int ret =
+  //     se_transmit_ex(MI2C_CMD_WR_SESSION, 0x02, (uint8_t *)passphase, len,
+  //                    &cur_cnts, &recv_len, MI2C_ENCRYPT, type,
+  //                    PROCESS_BEGIN);
+  // if (ret == MI2C_OK) {
+  //   return STATE_COMPLETE;
+  // }
   session->processing = PROCESS_GENERATING;
   session->type = type;
   return STATE_GENERATING;
 }
 
 se_generate_state_t se_sessionGenerating(se_generate_session_t *session) {
-  uint8_t cmd[5] = {0x80, 0xe7, 0x02, 0x00, 0x00};
-  uint8_t cur_cnts = 0xff;
-  uint16_t recv_len = 0;
-  cmd[3] = session->type;
-  if (MI2C_OK != se_transmit_plain(cmd, sizeof(cmd), &cur_cnts, &recv_len)) {
-    return STATE_GENERATING;
-  }
-
-  return STATE_COMPLETE;
+  APDU_INIT(0x80, 0xE7, 0x02, session->type);
+  SE_SEND_APDU_PLAIN(&apdu);
+  SE_GET_RESP_SW();
+  SW_REQUIRE(sw & SW_SUCCESS, SW_SUCCESS);
+  return (sw & 0xFF) > 0 ? STATE_GENERATING : STATE_COMPLETE;
 }
 
 bool se_sessionClose(void) {

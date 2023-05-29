@@ -265,3 +265,170 @@ bool bMI2CDRV_SendData(uint8_t *pucStr, uint16_t usStrLen) {
 }
 
 uint16_t get_lasterror(void) { return g_lasterror; }
+
+/// re-implementation
+static inline uint8_t xor_cal(uint8_t ref, const uint8_t *inbuf,
+                              uint16_t inlen) {
+  while (inlen-- > 0) {
+    ref ^= *inbuf++;
+  }
+  return ref;
+}
+
+static inline bool bmi2c_bus_prepare(uint32_t i2c, uint8_t mode,
+                                     uint32_t timeout) {
+  uint32_t timeout_cnt;
+  /* static uint16_t i2c_retry_cnts; */
+
+  i2c_retry_cnts = 0;
+  do {
+    if (i2c_retry_cnts > MI2C_RETRYCNTS) {
+      return false;
+    }
+    // send start
+    i2c_send_start(i2c);
+    i2c_enable_ack(i2c);
+    timeout_cnt = 0;
+    while (!(I2C_SR1(i2c) & I2C_SR1_SB)) {
+      timeout_cnt++;
+      if (timeout_cnt > timeout) {  // setup timeout is 5ms once
+        break;
+      }
+    }
+    // send read address
+    i2c_send_7bit_address(i2c, MI2C_ADDR, mode);
+    timeout_cnt = 0;
+    // Waiting for address is transferred.
+    while (!(I2C_SR1(i2c) & I2C_SR1_ADDR)) {
+      timeout_cnt++;
+      if (timeout_cnt > timeout) {  // setup timeout is 5ms once
+        break;
+      }
+    }
+    if (timeout_cnt > timeout) {
+      timeout_cnt = 0;
+      i2c_retry_cnts++;
+      i2c_send_stop(i2c);  // it will release i2c bus
+      continue;
+    }
+    //  i2c bus is ready
+    break;
+  } while (1);
+  /* Clearing ADDR condition sequence. */
+  (void)I2C_SR1(i2c);
+  (void)I2C_SR2(i2c);
+  return true;
+}
+
+static bool bmi2c_readbytes(uint32_t i2c, uint8_t *recv, uint16_t *recv_len,
+                            uint32_t timeout) {
+  uint8_t len_buf[2], xor = 0, xor_ref = 0;
+  uint16_t i, read_len;
+
+  // i2c bus prepare
+  if (!bmi2c_bus_prepare(i2c, MI2C_READ, timeout)) return false;
+  // read len
+  for (i = 0; i < 2; i++) {
+    while (!(I2C_SR1(i2c) & I2C_SR1_RxNE))
+      ;
+    len_buf[i] = i2c_get_data(i2c);
+  }
+  // cal len xor
+  xor = xor_cal(xor, len_buf, sizeof(len_buf));
+  // len
+  read_len = (len_buf[0] << 8) + (len_buf[1] & 0xFF);
+  if (read_len > *recv_len) {
+  }
+  if (!recv || read_len > *recv_len) {
+    i2c_send_stop(i2c);
+    return false;
+  }
+  *recv_len = read_len;
+
+  // read data sw and xor
+  while (read_len-- > 0) {
+    while (!(I2C_SR1(i2c) & I2C_SR1_RxNE))
+      ;
+    *recv = i2c_get_data(i2c);
+    xor = xor_cal(xor, recv, 1);
+    recv++;
+  }
+
+  // xor len
+  i2c_disable_ack(i2c);
+  for (i = 0; i < MI2C_XOR_LEN; i++) {
+    while (!(I2C_SR1(i2c) & I2C_SR1_RxNE))
+      ;
+    xor_ref = i2c_get_data(i2c);
+  }
+
+  i2c_send_stop(i2c);
+
+  if (xor != xor_ref) {
+    return false;
+  }
+  return true;
+}
+
+static bool bmi2c_writebytes(uint32_t i2c, const uint8_t *data,
+                             uint16_t datalen, uint32_t timeout) {
+  uint8_t len_buf[2], xor = 0;
+  uint16_t i;
+
+  // i2c bus prepare
+  if (!bmi2c_bus_prepare(i2c, MI2C_WRITE, timeout)) return false;
+
+  // send L + V + xor
+  len_buf[0] = ((datalen >> 8) & 0xFF);
+  len_buf[1] = datalen & 0xFF;
+  // len xor
+  xor = xor_cal(xor, len_buf, sizeof(len_buf));
+  // send len
+  for (i = 0; i < 2; i++) {
+    i2c_send_data(i2c, len_buf[i]);
+    while (!(I2C_SR1(i2c) & (I2C_SR1_TxE)))
+      ;
+  }
+  // cal xor
+  xor = xor_cal(xor, data, datalen);
+  // send data
+  while (datalen-- > 0) {
+    i2c_send_data(i2c, *data++);
+    while (!(I2C_SR1(i2c) & (I2C_SR1_TxE)))
+      ;
+  }
+  // send Xor
+  i2c_send_data(i2c, xor);
+  while (!(I2C_SR1(i2c) & (I2C_SR1_TxE)))
+    ;
+  i2c_send_stop(i2c);
+  return true;
+}
+
+void mi2c_init(void) {
+  rcc_periph_clock_enable(RCC_I2C1);
+  rcc_periph_clock_enable(RCC_GPIOB);
+
+  gpio_set_output_options(GPIO_MI2C_PORT, GPIO_OTYPE_OD, GPIO_OSPEED_50MHZ,
+                          GPIO_MI2C_SCL | GPIO_MI2C_SDA);
+  gpio_set_af(GPIO_MI2C_PORT, GPIO_AF4, GPIO_MI2C_SCL | GPIO_MI2C_SDA);
+  gpio_mode_setup(GPIO_MI2C_PORT, GPIO_MODE_AF, GPIO_PUPD_NONE,
+                  GPIO_MI2C_SCL | GPIO_MI2C_SDA);
+  i2c_reset(MI2CX);
+  delay_ms(100);
+  i2c_peripheral_disable(MI2CX);
+
+  // 100k
+  i2c_set_speed(MI2CX, i2c_speed_sm_100k, 30);
+  i2c_peripheral_enable(MI2CX);
+  delay_ms(100);
+}
+
+bool mi2c_send(const uint8_t *data, uint16_t data_len) {
+  if (data_len > MI2C_SEND_MAX_LEN) return false;
+  return bmi2c_writebytes(MI2CX, data, data_len, MI2C_TIMEOUT);
+}
+
+bool mi2c_receive(uint8_t *resp, uint16_t *resp_len) {
+  return bmi2c_readbytes(MI2CX, resp, resp_len, MI2C_TIMEOUT);
+}

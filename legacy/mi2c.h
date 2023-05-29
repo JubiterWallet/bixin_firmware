@@ -38,7 +38,7 @@
 
 #define MI2C_XOR_LEN (1)
 
-//#define	GET_MI2C_COMBUS	        (gpio_get(GPIO_MI2C_PORT, MI2C_COMBUS))
+// #define	GET_MI2C_COMBUS	        (gpio_get(GPIO_MI2C_PORT, MI2C_COMBUS))
 
 extern uint8_t g_ucMI2cRevBuf[MI2C_BUF_MAX_LEN];
 extern uint8_t g_ucMI2cSendBuf[MI2C_BUF_MAX_LEN];
@@ -63,5 +63,10 @@ extern uint16_t get_lasterror(void);
 #define bMI2CDRV_SendData(...) true
 #define bMI2CDRV_ReceiveData(...) true
 #endif
+
+/// re implementation
+void mi2c_init(void);
+bool mi2c_send(const uint8_t *data, uint16_t data_len);
+bool mi2c_receive(uint8_t *resp, uint16_t *resp_len);
 
 #endif

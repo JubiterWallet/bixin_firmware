@@ -119,4 +119,6 @@ bool se_hasWipeCode(void);
 bool se_changeWipeCode(const char *wipe_code);
 uint16_t se_lasterror(void);
 
+bool se_random_buffer(uint8_t *random, uint16_t count);
+
 #endif
