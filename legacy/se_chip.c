@@ -239,14 +239,14 @@ bool se_send_apdu_plain(const apdu_t *apdu, uint16_t *resp_len) {
   memzero(resp_buffer, resp_buffer_len);                \
   SE_CHECK_COND(se_send_apdu_plain(apdu, &resp_buffer_len))
 
-inline uint16_t encrypted_data_size(uint16_t lc) {
+static inline uint16_t encrypted_data_size(uint16_t lc) {
   // random|data|padding
   lc += 0x10;
   lc = (lc / 16 + 1) * 16;
   return lc;
 }
 
-inline void se_padding_80(uint8_t **data, uint16_t data_len) {
+static inline void se_padding_80(uint8_t **data, uint16_t data_len) {
   uint16_t padding_size = 16 - data_len % 16;
   **data = 0x80;
   (*data)++;
@@ -299,7 +299,7 @@ static inline bool se_build_safe_apdu(const apdu_t *apdu,
   return true;
 }
 
-inline void se_remove_80(uint8_t *data, uint16_t *data_len) {
+static inline void se_remove_80(uint8_t *data, uint16_t *data_len) {
   data += *data_len;
   while (*--data != 0x80) {
     *data_len -= 1;
@@ -1196,25 +1196,25 @@ bool se_setPinValidtime(uint8_t data) {
 }
 
 bool se_getPinValidtime(uint8_t *data_buf) {
-  uint8_t cmd[5 + 16] = {0x80, 0xe1, 0x15, 0x00, 0x10};
-  uint8_t recv_buf[0x20], ref_buf[0x20], rand_buf[0x10];
-  uint16_t recv_len = 0xff;  // 32 bytes session id
+  uint8_t rand_buf[0x10];
+
   aes_decrypt_ctx aes_dec_ctx;
 
-  // TODO. get se random 16 bytes
+  APDU_INIT(0x80, 0xe1, 0x15, 0x00);
   random_buffer_ST(rand_buf, 0x10);
-  memcpy(cmd + 5, rand_buf, sizeof(rand_buf));
-  if (MI2C_OK != se_transmit_plain(cmd, sizeof(cmd), recv_buf, &recv_len)) {
-    return false;
-  }
+  APDU_SET_DATA(&apdu, rand_buf, 0x10);
+  SE_SEND_APDU_PLAIN(&apdu);
+  SE_CHECK_RESP_SW();
+  resp_buffer_len -= 2;
   // TODO. parse returned data
-  if (recv_len != 0x20) return false;
+  if (resp_buffer_len != 0x20) return false;
+
   aes_decrypt_key128(g_ucSessionKey, &aes_dec_ctx);
-  aes_ecb_decrypt(recv_buf, ref_buf, recv_len, &aes_dec_ctx);
-  if (memcmp(ref_buf, rand_buf, sizeof(rand_buf)) != 0) return false;
+  aes_ecb_decrypt(resp_buffer, resp_buffer, resp_buffer_len, &aes_dec_ctx);
+  if (memcmp(resp_buffer, rand_buf, sizeof(rand_buf)) != 0) return false;
 
   // TODO. setted valid time and remained valid time
-  memcpy(data_buf, ref_buf + sizeof(rand_buf), 3);
+  memcpy(data_buf, resp_buffer + sizeof(rand_buf), 3);
   return true;
 }
 
@@ -1241,6 +1241,7 @@ bool se_beginGenerate(se_generate_type_t type, se_generate_session_t *session) {
 }
 
 bool se_generating(se_generate_session_t *session, bool *complete) {
+  SE_CHECK_COND(session->state == STATE_GENERATING);
   APDU_INIT(0x80, 0xE1, 0x12, session->type);
   SE_SEND_APDU_PLAIN(&apdu);
   SE_GET_RESP_SW();
@@ -1287,38 +1288,28 @@ bool se_set_entropy(const void *entropy, uint16_t len) {
 }
 
 bool se_isLifecyComSta(void) {
-  uint8_t cmd[5] = {0x00, 0xf8, 0x04, 00, 0x01};
-  uint8_t mode = 0;
-  uint16_t len = sizeof(mode);
-
-  if (MI2C_OK != se_transmit_plain(cmd, sizeof(cmd), &mode, &len)) {
-    return false;
-  }
-  if (len == 1 && mode == 0x82) {
-    return true;
-  }
-  return false;
+  APDU_INIT(0x00, 0xf8, 0x04, 0x00);
+  apdu.le = 0x01;
+  SE_SEND_APDU_PLAIN(&apdu);
+  SE_CHECK_RESP_SW();
+  return *resp_buffer == 0x82;
 }
 
 bool se_sessionStart(OUT uint8_t *session_id_bytes) {
-  uint8_t cmd[5] = {0x80, 0xe7, 0x00, 0x00, 0x00};
-  uint8_t recv_buf[0x20];
-  uint16_t recv_len = 0xff;  // 32 bytes session id
-
-  if (MI2C_OK != se_transmit_plain(cmd, sizeof(cmd), recv_buf, &recv_len)) {
-    return false;
-  }
-  // TODO. parse returned data
-  memcpy(session_id_bytes, recv_buf, 0x20);
+  APDU_INIT(0x80, 0xe7, 0x00, 0x00);
+  SE_SEND_APDU_PLAIN(&apdu);
+  SE_CHECK_RESP_SW();
+  memcpy(session_id_bytes, resp_buffer, 0x20);
   return true;
 }
 
 bool se_sessionOpen(IN uint8_t *session_id_bytes) {
-  uint16_t recv_len = 0;
-  if (MI2C_OK != se_transmit(MI2C_CMD_WR_SESSION, 0x01, session_id_bytes, 32,
-                             NULL, &recv_len, MI2C_ENCRYPT, GET_SESTORE_DATA)) {
-    return false;
-  }
+  APDU_INIT(0x80, 0xe7, 0x01, 0x00);
+  APDU_SET_DATA(&apdu, session_id_bytes, 0x20);
+  SE_SEND_APDU_SECURE(&apdu, SE_SECURE_SEND);
+  SE_GET_RESP_SW();
+  SW_REQUIRE(sw & SW_SUCCESS, SW_SUCCESS);
+  SE_CHECK_COND((sw & 0xFF) > 0);
   return true;
 }
 
@@ -1347,20 +1338,16 @@ bool se_sessionGenerating(se_generate_session_t *session, bool *complete) {
 }
 
 bool se_sessionClose(void) {
-  uint16_t recv_len = 0;
-  if (MI2C_OK != se_transmit(MI2C_CMD_WR_SESSION, 0x03, NULL, 0, NULL,
-                             &recv_len, MI2C_ENCRYPT, GET_SESTORE_DATA)) {
-    return false;
-  }
+  APDU_INIT(0x80, 0xe7, 0x03, 0x00);
+  SE_SEND_APDU_PLAIN(&apdu);
+  SE_CHECK_RESP_SW();
   return true;
 }
 
 bool se_sessionClear(void) {
-  uint16_t recv_len = 0;
-  if (MI2C_OK != se_transmit(MI2C_CMD_WR_SESSION, 0x04, NULL, 0, NULL,
-                             &recv_len, MI2C_ENCRYPT, GET_SESTORE_DATA)) {
-    return false;
-  }
+  APDU_INIT(0x80, 0xe7, 0x04, 0x00);
+  SE_SEND_APDU_PLAIN(&apdu);
+  SE_CHECK_RESP_SW();
   return true;
 }
 

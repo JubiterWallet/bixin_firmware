@@ -267,6 +267,20 @@ bool bMI2CDRV_SendData(uint8_t *pucStr, uint16_t usStrLen) {
 uint16_t get_lasterror(void) { return g_lasterror; }
 
 /// re-implementation
+#define MI2C_SEND_DATA(i2c, data)           \
+  do {                                      \
+    i2c_send_data(i2c, data);               \
+    while (!(I2C_SR1(i2c) & (I2C_SR1_TxE))) \
+      ;                                     \
+  } while (0)
+
+#define MI2C_RECV_DATA(i2c, data)          \
+  do {                                     \
+    while (!(I2C_SR1(i2c) & I2C_SR1_RxNE)) \
+      ;                                    \
+    data = i2c_get_data(i2c);              \
+  } while (0)
+
 static inline uint8_t xor_cal(uint8_t ref, const uint8_t *inbuf,
                               uint16_t inlen) {
   while (inlen-- > 0) {
@@ -328,17 +342,13 @@ static bool bmi2c_readbytes(uint32_t i2c, uint8_t *recv, uint16_t *recv_len,
   // i2c bus prepare
   if (!bmi2c_bus_prepare(i2c, MI2C_READ, timeout)) return false;
   // read len
-  for (i = 0; i < 2; i++) {
-    while (!(I2C_SR1(i2c) & I2C_SR1_RxNE))
-      ;
-    len_buf[i] = i2c_get_data(i2c);
+  for (i = 0; i < sizeof(len_buf); i++) {
+    MI2C_RECV_DATA(i2c, len_buf[i]);
   }
   // cal len xor
   xor = xor_cal(xor, len_buf, sizeof(len_buf));
   // len
   read_len = (len_buf[0] << 8) + (len_buf[1] & 0xFF);
-  if (read_len > *recv_len) {
-  }
   if (!recv || read_len > *recv_len) {
     i2c_send_stop(i2c);
     return false;
@@ -347,21 +357,15 @@ static bool bmi2c_readbytes(uint32_t i2c, uint8_t *recv, uint16_t *recv_len,
 
   // read data sw and xor
   while (read_len-- > 0) {
-    while (!(I2C_SR1(i2c) & I2C_SR1_RxNE))
-      ;
-    *recv = i2c_get_data(i2c);
+    MI2C_RECV_DATA(i2c, *recv);
     xor = xor_cal(xor, recv, 1);
     recv++;
   }
-
   // xor len
   i2c_disable_ack(i2c);
   for (i = 0; i < MI2C_XOR_LEN; i++) {
-    while (!(I2C_SR1(i2c) & I2C_SR1_RxNE))
-      ;
-    xor_ref = i2c_get_data(i2c);
+    MI2C_RECV_DATA(i2c, xor_ref);
   }
-
   i2c_send_stop(i2c);
 
   if (xor != xor_ref) {
@@ -385,22 +389,16 @@ static bool bmi2c_writebytes(uint32_t i2c, const uint8_t *data,
   xor = xor_cal(xor, len_buf, sizeof(len_buf));
   // send len
   for (i = 0; i < 2; i++) {
-    i2c_send_data(i2c, len_buf[i]);
-    while (!(I2C_SR1(i2c) & (I2C_SR1_TxE)))
-      ;
+    MI2C_SEND_DATA(i2c, len_buf[i]);
   }
   // cal xor
   xor = xor_cal(xor, data, datalen);
   // send data
   while (datalen-- > 0) {
-    i2c_send_data(i2c, *data++);
-    while (!(I2C_SR1(i2c) & (I2C_SR1_TxE)))
-      ;
+    MI2C_SEND_DATA(i2c, *data++);
   }
   // send Xor
-  i2c_send_data(i2c, xor);
-  while (!(I2C_SR1(i2c) & (I2C_SR1_TxE)))
-    ;
+  MI2C_SEND_DATA(i2c, xor);
   i2c_send_stop(i2c);
   return true;
 }
