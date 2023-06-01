@@ -1229,32 +1229,24 @@ bool se_applyPinValidtime(void) {
   return true;
 }
 
-se_generate_state_t se_beginGenerate(se_generate_type_t type,
-                                     se_generate_session_t *session) {
+bool se_beginGenerate(se_generate_type_t type, se_generate_session_t *session) {
   APDU_INIT(0x80, 0xE1, 0x12, type);
   SE_SEND_APDU_SECURE(&apdu, SE_SECURE_SEND);
   SE_GET_RESP_SW();
   SW_REQUIRE(sw & SW_SUCCESS, SW_SUCCESS);
   SE_CHECK_COND((sw & 0xFF) > 0);
-
-  // uint8_t cur_cnts = 0xff;
-  // uint16_t recv_len = 0;
-  // if (MI2C_OK == se_transmit_ex(MI2C_CMD_WR_PIN, 0x12, NULL, 0, &cur_cnts,
-  //                               &recv_len, MI2C_ENCRYPT, type,
-  // PROCESS_BEGIN)) {
-  //   return STATE_FAILD;
-  // }
-  session->processing = PROCESS_GENERATING;
+  session->state = STATE_GENERATING;
   session->type = type;
-  return STATE_GENERATING;
+  return true;
 }
 
-se_generate_state_t se_generating(se_generate_session_t *session) {
+bool se_generating(se_generate_session_t *session, bool *complete) {
   APDU_INIT(0x80, 0xE1, 0x12, session->type);
   SE_SEND_APDU_PLAIN(&apdu);
   SE_GET_RESP_SW();
   SW_REQUIRE(sw & SW_SUCCESS, SW_SUCCESS);
-  return (sw & 0xFF) > 0 ? STATE_GENERATING : STATE_COMPLETE;
+  *complete = (sw & 0xFF) == 0;
+  return true;
 }
 
 bool se_isFactoryMode(void) {
@@ -1330,37 +1322,28 @@ bool se_sessionOpen(IN uint8_t *session_id_bytes) {
   return true;
 }
 
-se_generate_state_t se_sessionBeginGenerate(const uint8_t *passphase,
-                                            uint16_t len,
-                                            se_generate_type_t type,
-                                            se_generate_session_t *session) {
+bool se_sessionBeginGenerate(const uint8_t *passphase, uint16_t len,
+                             se_generate_type_t type,
+                             se_generate_session_t *session) {
   APDU_INIT(0x90, 0xE7, 0x02, type);
   APDU_SET_DATA(&apdu, passphase, len);
   SE_SEND_APDU_SECURE(&apdu, SE_SECURE_SEND);
   SE_GET_RESP_SW();
   SW_REQUIRE(sw & SW_SUCCESS, SW_SUCCESS);
   SE_CHECK_COND((sw & 0xFF) > 0);
-
-  // uint8_t cur_cnts = 0xff;
-  // uint16_t recv_len = 0;
-  // unsigned int ret =
-  //     se_transmit_ex(MI2C_CMD_WR_SESSION, 0x02, (uint8_t *)passphase, len,
-  //                    &cur_cnts, &recv_len, MI2C_ENCRYPT, type,
-  //                    PROCESS_BEGIN);
-  // if (ret == MI2C_OK) {
-  //   return STATE_COMPLETE;
-  // }
-  session->processing = PROCESS_GENERATING;
+  session->state = STATE_GENERATING;
   session->type = type;
-  return STATE_GENERATING;
+  return true;
 }
 
-se_generate_state_t se_sessionGenerating(se_generate_session_t *session) {
+bool se_sessionGenerating(se_generate_session_t *session, bool *complete) {
+  SE_CHECK_COND(session->state == STATE_GENERATING);
   APDU_INIT(0x80, 0xE7, 0x02, session->type);
   SE_SEND_APDU_PLAIN(&apdu);
   SE_GET_RESP_SW();
   SW_REQUIRE(sw & SW_SUCCESS, SW_SUCCESS);
-  return (sw & 0xFF) > 0 ? STATE_GENERATING : STATE_COMPLETE;
+  *complete = (sw & 0xFF) == 0;
+  return true;
 }
 
 bool se_sessionClose(void) {

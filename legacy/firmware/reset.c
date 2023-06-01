@@ -544,15 +544,16 @@ bool generate_seed_steps(void) {
 #define SESSION_GENERATE_STEP(type, precent)                           \
   do {                                                                 \
     se_generate_session_t session = {0};                               \
-    se_generate_state_t state = se_beginGenerate(type, &session);      \
+    bool ret = se_beginGenerate(type, &session);                       \
     int step = 1;                                                      \
-    while (state == STATE_GENERATING) {                                \
+    bool complete = false;                                             \
+    do {                                                               \
       int permil = base + step * (precent / 100);                      \
       layoutProgressAdapter(_("Generating session seed ..."), permil); \
       step++;                                                          \
-      state = se_generating(&session);                                 \
-    }                                                                  \
-    if (state != STATE_COMPLETE) return false;                         \
+      ret = se_generating(&session, &complete);                        \
+    } while (ret && !complete);                                        \
+    if (!ret) return false;                                            \
     base += precent;                                                   \
   } while (0)
 

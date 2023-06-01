@@ -444,21 +444,21 @@ inline static bool session_generate_steps(uint8_t *passphrase, uint16_t len) {
   // one thousandth precision
   int base = 0;
 
-#define SESSION_GENERATE_STEP(type, precent)                           \
-  do {                                                                 \
-    if ((precent) == 0) return true;                                   \
-    se_generate_session_t session = {0};                               \
-    se_generate_state_t state =                                        \
-        se_sessionBeginGenerate(passphrase, len, type, &session);      \
-    int step = 1;                                                      \
-    while (state == STATE_GENERATING) {                                \
-      int permil = base + step * (precent / 100);                      \
-      layoutProgressAdapter(_("Generating session seed ..."), permil); \
-      step++;                                                          \
-      state = se_sessionGenerating(&session);                          \
-    }                                                                  \
-    if (state != STATE_COMPLETE) return false;                         \
-    base += precent;                                                   \
+#define SESSION_GENERATE_STEP(type, precent)                             \
+  do {                                                                   \
+    if ((precent) == 0) return true;                                     \
+    se_generate_session_t session = {0};                                 \
+    bool ret = se_sessionBeginGenerate(passphrase, len, type, &session); \
+    int step = 1;                                                        \
+    bool complete = false;                                               \
+    do {                                                                 \
+      int permil = base + step * (precent / 100);                        \
+      layoutProgressAdapter(_("Generating session seed ..."), permil);   \
+      step++;                                                            \
+      ret = se_sessionGenerating(&session, &complete);                   \
+    } while (ret && !complete);                                          \
+    if (!ret) return false;                                              \
+    base += precent;                                                     \
   } while (0)
 
   // generate `seed` 'minisecret' or `icarus main secret`

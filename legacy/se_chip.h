@@ -41,19 +41,13 @@ typedef struct {
 } se_session_cached_status;
 
 typedef enum {
-  PROCESS_BEGIN = 0xFF,
-  PROCESS_GENERATING = 0x01,
-} se_generate_process_t;
-
-typedef enum {
-  STATE_FAILD,
+  STATE_BEGIN,
   STATE_GENERATING,
-  STATE_COMPLETE,
 } se_generate_state_t;
 
 typedef struct {
   se_generate_type_t type;
-  se_generate_process_t processing;
+  se_generate_state_t state;
 } se_generate_session_t;
 
 bool se_sync_session_key(void);
@@ -92,16 +86,14 @@ bool se_sessionStart(OUT uint8_t *session_id_bytes);
 bool se_sessionOpen(IN uint8_t *session_id_bytes);
 
 // generateing secret when create/recover wallet
-se_generate_state_t se_beginGenerate(se_generate_type_t type,
-                                     se_generate_session_t *session);
-se_generate_state_t se_generating(se_generate_session_t *session);
+bool se_beginGenerate(se_generate_type_t type, se_generate_session_t *session);
+bool se_generating(se_generate_session_t *session, bool *complete);
 
 // generateing secret when use passprase session
-se_generate_state_t se_sessionBeginGenerate(const uint8_t *passphase,
-                                            uint16_t len,
-                                            se_generate_type_t type,
-                                            se_generate_session_t *session);
-se_generate_state_t se_sessionGenerating(se_generate_session_t *session);
+bool se_sessionBeginGenerate(const uint8_t *passphase, uint16_t len,
+                             se_generate_type_t type,
+                             se_generate_session_t *session);
+bool se_sessionGenerating(se_generate_session_t *session, bool *complete);
 
 bool se_getSessionCachedState(se_session_cached_status *status);
 bool se_sessionClose(void);
